@@ -8,18 +8,6 @@
  * NOTE TO STUDENTS: Replace this header comment with your own header
  * comment that gives a high level description of your solution.
  *
- * This allocator uses a segregated free list. We have different explicit
- * free lists based on the size class. 
- *
- *
- *
- *
- *
- *
- *
- *
- *
- *
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,8 +40,6 @@ team_t team = {
  * Basic Constants and Macros
  * You are not required to use these macros but may find them helpful.
 *************************************************************************/
-#define DEBUG
-
 #define WSIZE       sizeof(void *)            /* word size (bytes) */
 #define DSIZE       (2 * WSIZE)            /* doubleword size (bytes) */
 #define CHUNKSIZE   (1<<7)      /* initial heap size (bytes) */
@@ -79,22 +65,27 @@ team_t team = {
 #define NEXT_BLKP(bp) ((char *)(bp) + GET_SIZE(((char *)(bp) - WSIZE)))
 #define PREV_BLKP(bp) ((char *)(bp) - GET_SIZE(((char *)(bp) - DSIZE)))
 
-#define MAX_SIZE_CLASS 4 //2^10 = 1024 * 16 = plenty for now
+/*************************************************************************
+ * Custom Constants and Macros
+*************************************************************************/
+#define MAX_SIZE_CLASS 20 //experiment with this
 #define MINIMUM_BLOCK_SIZE 32 //factoring in 16 bytes overhead and alignment
-
 
 /*Global variables*/
 void* heap_listp = NULL;
 int request_id; //this is for debugging comment it out later
-// static void *segregated_list[MAX_SIZE_CLASS]; //void* = 8 bytes * 4 = 256 bits? seems kinda low
-
+static void *segregated_list[MAX_SIZE_CLASS];
 
 /*Forward declarations*/
-
+size_t map_size_class (size_t size);
 static void myprintblock(void *bp);
 static void mycheckblock(void *bp);
-static int check_overlap ();
-void myheapcheck();
+static int check_overlap (void);
+static int check_hf_consistency(void *bp);
+static int check_aligment(void *bp);
+static int check_no_uncoalesced_free_blocks(void *bp);
+static void myheapcheck(void);
+int mm_check(void);
 void *extend_heap(size_t words);
 
 /**********************************************************
@@ -177,16 +168,16 @@ size_t map_size_class (size_t size){
      PUT(heap_listp + (3 * WSIZE), PACK(0, 1));    // epilogue header
      heap_listp += DSIZE;
 
-     //check consistency
-     // printf("before extend:\n");
-     // myheapcheck();
+     // check consistency
+     printf("before extend:\n");
+     myheapcheck();
 
-    // /* Extend the empty heap with a free block of CHUNKSIZE bytes */
-     // if ((bp = extend_heap(4*CHUNKSIZE)) == NULL)
-        // return -1;
+    /* Extend the empty heap with a free block of CHUNKSIZE bytes */
+     if ((bp = extend_heap(4*CHUNKSIZE)) == NULL)
+        return -1;
 
-     // printf("after extend:\n");
-     // myheapcheck();
+     printf("after extend:\n");
+     myheapcheck();
 
      // exit(0); //for debugging purposes
      return 0;
@@ -286,13 +277,26 @@ void place(void* bp, size_t asize)
 {
   /* Get the current block size */
   size_t bsize = GET_SIZE(HDRP(bp));
+  assert(bsize >= asize); //should be allocating to a suitably big free block 
+  size_t split_size = bsize - asize;
 
-  PUT(HDRP(bp), PACK(bsize, 1));
-  PUT(FTRP(bp), PACK(bsize, 1));
+  if (split_size <= MINIMUM_BLOCK_SIZE){
+    //don't split in this case
+    PUT(HDRP(bp), PACK(bsize, 1)); 
+    PUT(FTRP(bp), PACK(bsize, 1));
+  }
 
-  //for debugging purposes
-  if (request_id == 1)
-    exit(0);
+  else {
+    //Split block
+    PUT(FTRP(bp), PACK(split_size, 0)); //old ftrp becomes ftrp of split free block
+    PUT(HDRP(bp), PACK(asize, 1)); //old hdrp becomes hdrp of split alloced block
+    PUT(FTRP(bp), PACK(asize, 1)); //get the new footer of the newly alloced block
+    PUT(HDRP(NEXT_BLKP(bp)), PACK(split_size, 0)); //set the new hdrp for the split free block
+  }
+
+  // for debugging purposes
+  // if (request_id == 3)
+  //   exit(0);
   request_id++;
 }
 
@@ -359,6 +363,8 @@ void *mm_malloc(size_t size)
     if ((bp = extend_heap(extendsize/WSIZE)) == NULL)
         return NULL;
     place(bp, asize);
+    printf("After malloc(%zu): malloc(%zu)\n", size, asize);
+    myheapcheck();
     return bp;
 
 }
@@ -429,20 +435,74 @@ static void myprintblock(void *bp){
     }
 }
 
+/**********************************************************
+ * Checks that free blocks have been coalesced. 
+ * Corner cases: start and end of heap
+ *********************************************************/
+static int check_no_uncoalesced_free_blocks(void *bp){
+
+    size_t bp_alloc = GET_ALLOC(HDRP(bp));
+    size_t next_bp_size = GET_SIZE(HDRP(NEXT_BLKP(bp)));    
+    size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
+    size_t prev_bp_size = GET_SIZE(HDRP(PREV_BLKP(bp)));
+    size_t prev_alloc = GET_ALLOC(HDRP(PREV_BLKP(bp)));
+
+    unsigned int prev_blk_free = (prev_bp_size != 0) && (prev_alloc == 0);
+    unsigned int next_blk_free = (next_bp_size != 0) && (next_alloc == 0);
+
+    //corner cases
+    if (bp_alloc == 0){
+        if (prev_blk_free || next_blk_free){
+            fprintf(stderr, "mm_check: uncoalesced free blocks!\n");
+            assert (0);
+        }
+    }
+    return 1; 
+} 
+/**********************************************************
+ * Checks header-footer consistency & alignment.
+ * Return non-zero if pass.
+ *********************************************************/
+static int check_hf_consistency(void *bp){
+    volatile size_t hdr_size = GET_SIZE(HDRP(bp));
+    volatile size_t hdr_alloc = GET_ALLOC(HDRP(bp));
+    volatile size_t ftr_size = GET_SIZE(FTRP(bp));
+    volatile size_t ftr_alloc = GET_ALLOC(FTRP(bp));
+    //check header consistency
+    if (hdr_size != ftr_size || hdr_alloc != ftr_alloc){
+        fprintf(stderr, "mm_check: header-footer consistency failed!\n");
+        assert(0); //failed header-footer consistency check
+    }    
+    return 1;
+}
+
+static int check_aligment(void *bp){
+    assert(check_hf_consistency(bp)); //no metadata incosistency
+    if (!((size_t)HDRP(bp) % DSIZE) || !((size_t)HDRP(NEXT_BLKP(bp)) % DSIZE)) {
+        fprintf(stderr, "mm_check: alignment test failed!\n");
+        assert(0);
+    }
+    return 1; 
+}
+
+// static int check_overlap (){
+
+// }
+
+/**********************************************************
+ * Neanderthal mm_check.
+ *********************************************************/
 static void mycheckblock(void *bp){
     volatile size_t hdr_size = GET_SIZE(HDRP(bp));
     volatile size_t hdr_alloc = GET_ALLOC(HDRP(bp));
     volatile size_t ftr_size = GET_SIZE(FTRP(bp));
     volatile size_t ftr_alloc = GET_ALLOC(FTRP(bp));
-
     //check header consistency
     if (hdr_size != ftr_size || hdr_alloc != ftr_alloc){
         fprintf(stderr, "my_check: header-footer consistency failed!\n");
         assert(0); //failed header-footer consistency check
     }
-
     //check if aligned
-
     if (!((size_t)HDRP(bp) % DSIZE) || !((size_t)HDRP(NEXT_BLKP(bp)) % DSIZE)) {
         fprintf(stderr, "my_check: alignment test failed!\n");
         assert(0);
@@ -450,15 +510,14 @@ static void mycheckblock(void *bp){
     return;
 }
 
-// static int check_overlap (){
-
-// }
-
-void myheapcheck(){
+static void myheapcheck(void){
     char *bp;
     for (bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)){
         myprintblock(bp);
-        mycheckblock(bp);
+        // mycheckblock(bp);
+        check_hf_consistency(bp);
+        check_aligment(bp);
+        check_no_uncoalesced_free_blocks(bp);
     }
     printf("my_check: pass\n");    
 }
