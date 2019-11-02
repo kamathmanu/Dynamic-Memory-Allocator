@@ -133,7 +133,7 @@ void* prologue_h = NULL; //prologue header
 void* epilogue_h = NULL; //epilogue header
 int request_id; //this is for debugging comment it out later
 static void *segregated_list[MAX_SIZE_CLASS];
-static unsigned int do_coalesce; 
+static unsigned int flag_coalesce; 
 /*************************************************************************
  * Forward Declarations of Helper Functions
 *************************************************************************/
@@ -287,7 +287,7 @@ void remove_free_block (void *bp){
 int mm_init(void)
 {
     //request_id = -1; 
-    do_coalesce = 1; 
+    flag_coalesce = 1; 
     heap_listp = NULL;
     prologue_h = NULL; epilogue_h = NULL;
 
@@ -429,10 +429,10 @@ void *extend_heap(size_t words)
     
     // If the last block is free, extend the heap by remainder needed.
     //Actually this might not be such a great thing. Naive extension might be better. 
-    // if (GET_ALLOC(epilogue_h - WSIZE) == 0){
-    //     size_t available_free_space = GET_SIZE(epilogue_h - WSIZE); 
-    //     size -= available_free_space;
-    // }
+    if (GET_ALLOC(epilogue_h - WSIZE) == 0){
+        size_t available_free_space = GET_SIZE(epilogue_h - WSIZE); 
+        size -= available_free_space;
+    }
 
     if ( (bp = mem_sbrk(size)) == (void *)-1 )
         return NULL;
@@ -526,9 +526,9 @@ void mm_free(void *bp)
     PUT(FTRP(bp), PACK(size,0));
     //NORMAL HEAP CHECKs here
     insert_free_block(bp);
-    /*if (do_coalesce){*/
+    if (flag_coalesce){
     coalesce(bp);
-    /*}*/     
+    }     
     // printf("After free(%p):\n",bp);
     // mm_check_wrapper(); // myheapcheck();
 }
@@ -596,8 +596,23 @@ void *mm_malloc(size_t size)
 }
 /**********************************************************
  * mm_realloc
- * Implemented simply in terms of mm_malloc and mm_free
- ***********************REFERENCE**********************************/
+ * If ptr = NULL, return mm_malloc(size)
+ * If size = 0, mm_free(ptr) then return NULL
+ * If the oldsize is sufficient, just return the ptr
+ * For reallocation: 
+ * Rather than malloc first and then free the old block,
+ * I first free the old block to take advantage of any
+ * physically adjacent free blocks. To make sure that data (payload)
+ * isn't lost, we first store copies of the first 2 words of the
+ * oldptr block (this will be replaced by pred_ptr and succ_ptr once
+ * freed) and also prevent the block from coalescing during the free
+ * (do make sure we still have access to that block). Then, re-enable
+ * coalescing and mm_malloc(size) where the allocation is done along with
+ * necessary coalescing and splitting. After that, we copy over the contents
+ * of the old block to the new one, and also paste back the first 2 words that
+ * got replaced by free metadata.  
+
+/*********************************************************/
 void *mm_realloc(void *ptr, size_t size)
 {
     /* If size == 0 then this is just free, and we return NULL. */
@@ -610,19 +625,40 @@ void *mm_realloc(void *ptr, size_t size)
       return (mm_malloc(size));
 
     void *oldptr = ptr;
+    size_t oldSize, asize;
+    oldSize = GET_SIZE(HDRP(oldptr));
+    asize = DSIZE * ((size + (DSIZE) + (DSIZE-1))/ DSIZE);
+    //if our original size is good enough, no need to do any allocation, 
+    //our current pointer is good enough.
+    if (asize <= oldSize){
+        assert(ptr != NULL); //should have handled this already
+        return ptr; 
+    }
+
+    //copy the 1st 2 words of the current payload to save these from getting
+    //replaced by the PRED & SUCC once freed.
+    uintptr_t payload_word1 = GET(oldptr);
+    uintptr_t payload_word2 = GET(oldptr+WSIZE);    
+    //temporarily disable coalescing to keep track of the old payload data
+    flag_coalesce = 0;
+    mm_free(oldptr);
+    flag_coalesce = 1; 
+
     void *newptr;
-    size_t copySize;
-    
-    newptr = mm_malloc(size);
-    if (newptr == NULL)
-      return NULL;
+    newptr = mm_malloc(size*2);
+    if (newptr == NULL){
+        return NULL;
+    }
 
     /* Copy the old data. */
-    copySize = GET_SIZE(HDRP(oldptr));
+    size_t copySize = oldSize;
     if (size < copySize)
-      copySize = size;
+      copySize = size;    
     memcpy(newptr, oldptr, copySize);
-    mm_free(oldptr);
+    //rewrite the (saved) first two words of the payload that got lost while
+    //freeing
+    PUT(newptr, payload_word1);
+    PUT(newptr+WSIZE, payload_word2);
     return newptr;
 }
 /**********************DEBUG*************************************/
